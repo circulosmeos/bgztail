@@ -74,6 +74,14 @@ To show only internals of bgzip format handling (not-contents output is always p
                 Br = 0, Fr = 0, #blks = 1
     waiting for input...
 
+# Notes on implementation
+
+* *bgzip* actually do not set the timestamp in gzip headers, so parsing is quite simplied for this reason (is always *0x0*).
+
+* even incomplete (growing) *bgzip* blocks are supported. Even though incomplete blocks are unlikely to live growing *in the wild*, it can be useful to determine possible corruptions of static *bgzip* files (use *-l* parameter).
+
+* bgzipped-file-to-tail may not exist when running: the script will patiently wait for its creation.
+
 # Author
 
 [circulosmeos](https://github.com/circulosmeos)
