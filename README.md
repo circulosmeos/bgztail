@@ -6,7 +6,7 @@ Continuous tail Perl script (à la `tail -f`) for *bgzipped* files.
 
 Nonetheless, `bgztail` can only tail bgzipped files, because gzip implies a complete file reading to reach the tail. This can be cumbersome with compressed files of various Gigabytes in size...
 
-`bgztail` **does not** need the index file (as with `$ bgzip -i`) to be created.
+`bgztail` **does not** need the index file (as with `bgzip -i`) to be created.
 
 Note that `bgztail` outputs warnings to *STDERR* and file contents to *STDIN*.
 
@@ -14,11 +14,14 @@ The script is compatible with Windows' Perl. A *bgztail.bat* demo file is provid
 
 # Use
 
-    bgztail [-ChilLv] FILE
+    bgztail [-#CfhilLv] FILE
 
-  FILE may not yet exist: bgzip will wait for its creation.
+  -#: a number: tail only that number of lines, and exit.
 
   -C: do not use colors on error/warning messages.
+
+  -f: output appended data as the file grows (like `tail -f`).
+      If FILE doesn't exist yet, bgztail waits for its creation.
 
   -h: show this help.
 
@@ -34,10 +37,13 @@ The script is compatible with Windows' Perl. A *bgztail.bat* demo file is provid
 
 # Examples
 
-Usual case:
+Usual case: use bgztail as a "*tail -f*" on a bgzip-compressed file:
   
-    $ bgztail /var/log/my_log.gz
+    $ bgztail -f /var/log/my_log.gz
 
+or tail just some lines of it and exit (by default 10 lines):
+
+    $ bgztail /var/log/my_log.gz
 
 If a *gzip* (not *bgzip*) file is selected, a warning is shown and the script exists. Nonetheless, *bgzip* compression format **is compatible with gzip**, so bgzipped files can be uncompressed with *gunzip*. But `bgztail` can only tail bgzipped files, because *gzip* implies a complete file reading to reach the tail.
 
@@ -76,11 +82,11 @@ To show only internals of bgzip format handling (not-contents output is always p
 
 # Notes on implementation
 
-* *bgzip* actually do not set the timestamp in gzip headers, so parsing is quite simplied for this reason (is always *0x0*).
+* *bgzip* actually does not set the timestamp in gzip headers, so parsing them is quite simple for this reason (timestamp is always *0x0*).
 
-* even incomplete (growing) *bgzip* blocks are supported. Even though incomplete blocks are unlikely to live growing *in the wild*, it can be useful to determine possible corruptions of static *bgzip* files (use *-l* parameter).
+* even incomplete (growing) *bgzip* blocks are supported. Even though incomplete blocks are unlikely to live growing *in the wild*, this can be useful to determine possible corruptions of static *bgzip* files (use *-l* parameter).
 
-* bgzipped-file-to-tail may not exist when running: the script will patiently wait for its creation.
+* bgzipped-file-to-tail may not exist when running: the script will patiently wait for its creation when `-f` is indicated.
 
 # Author
 

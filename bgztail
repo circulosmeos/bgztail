@@ -6,8 +6,8 @@
 # bgzip format: //github.com/samtools/htslib/blob/develop/bgzip.c
 #
 # //github.com/circulosmeos/bgztail
-# v1.0 by circulosmeos, 06-2019
-# under GPL v3
+# v1.0, v2.0 by circulosmeos, 06-2019
+# licensed under GPL v3
 #
 use strict;
 
@@ -16,10 +16,10 @@ use IO::Uncompress::Gunzip qw(gunzip $GunzipError);
 
 use Term::ANSIColor; # for stderr messages
 
-my $BGZTAIL_VERSION = '1.0';
+my $BGZTAIL_VERSION = '2.0';
 
 my ( $input_filename, $fInput, $file_size, $file_size2, 
-	$buffer, $buffer2, $i, $end_loop );
+	$buffer, $buffer2, $i, $end_loop, $waiting_cycle );
 
 # from bgzf.c @ https://github.com/samtools/htslib/
 # See also https://tools.ietf.org/html/rfc1952#page-5
@@ -34,10 +34,13 @@ my $BLOCK_SRCHNG_SIZE = int( $MAX_BLOCK_SIZE / 2 );
 my $SLEEP_TOO_SHORT = 0.3;
 my $SLEEP_NEXIST    = 0.6;
 
-my ( $CLR_MSG_DFLT, $CLR_MSG_ERROR, $CLR_MSG_EOF ) = ( 'blue', 'bright_magenta', 'bold yellow' );
+my ( $CLR_MSG_DFLT, $CLR_MSG_ERROR, $CLR_MSG_INFO ) = ( 'blue', 'bright_magenta', 'bold yellow' );
+
+my ( $EXIT_OK, $EXIT_KO ) = ( 0, 1 ); # standard cmdline exit values
 
 # predeclarations
 sub print_message ( $; $ );
+sub tail_string ( $$ );
 
 # Endianess determination is unneeded because unpack will do it all for us
 
@@ -59,6 +62,13 @@ my $LOG = 1;
 # TODO: may be more methods in the future...
 my $PRINT_INCOMPLETE_BLOCKS = 1;
 
+# if '-#', that number of lines will be tailed, and the script will exit
+my $LINES_TO_TAIL = -1;
+
+my $DEFAULT_LINES_TO_TAIL = 10;
+
+my $CONTINUOUS_TAILING = 0;
+
 # get cmdline parameters
 
 my $parameters;
@@ -67,7 +77,7 @@ my $parameters;
 
 if ( $parameters =~ /^\-[\-\w]+$/ ) {
 
-	if ( $parameters =~ /^\-[\-ChilLv]+$/ ) { # red hot ChilLy bgzips !
+	if ( $parameters =~ /^\-[\-\dCfhilLv]+$/ ) {
 		if ( $parameters =~ /h/ ) {
 			goto SHOW_MAN_PAGE;
 		}
@@ -75,9 +85,12 @@ if ( $parameters =~ /^\-[\-\w]+$/ ) {
 			print "\nbgztail v$BGZTAIL_VERSION //github.com/circulosmeos/bgztail\n\n";
 			exit 0;
 		}
-		($input_filename = shift @ARGV) || goto SHOW_MAN_PAGE;
+		($input_filename = shift @ARGV) || (
+			print_message( "\nError: File parameter absent.\n", $CLR_MSG_ERROR ),
+			goto SHOW_MAN_PAGE
+			);
 	} else {
-		print_message( "\nParameters contain unrecognized options: '$parameters'\nwhilst expected: '-[-ChilLv]'\n" );
+		print_message( "\nError: Parameters contain unrecognized options:\n'$parameters'\nwhilst expected: '-[-#CfhilLv]'\n" );
 		exit 1;
 	}
 
@@ -93,11 +106,22 @@ if ( length($input_filename) == 0 ) {
 }
 
 if ($parameters ne '') {
-        # -h was previously processed and implied immediate end.
-        $PRINT_COLOR = 0 if $parameters =~ /C/;
-        $PRINT_INCOMPLETE_BLOCKS = 0 if $parameters =~ /i/;
-        $LOG = 2 if $parameters =~ /l/; # verbose internal states
-        $LOG = 0 if $parameters =~ /L/;
+	# -h was previously processed and implied immediate end.
+	$PRINT_COLOR = 0 if $parameters =~ /C/;
+	$PRINT_INCOMPLETE_BLOCKS = 0 if $parameters =~ /i/;
+	$LOG = 2 if $parameters =~ /l/; # verbose internal states
+	$LOG = 0 if $parameters =~ /L/;
+	$LINES_TO_TAIL = $1 if $parameters =~ /(\d+)/;
+	if ( $parameters =~ /f/ ) {
+		$CONTINUOUS_TAILING = 1;
+		# and show some lines from last block:
+		$LINES_TO_TAIL = $DEFAULT_LINES_TO_TAIL if $LINES_TO_TAIL == -1;
+	} elsif ( $LINES_TO_TAIL == -1 ) {
+		# as continous tailing is not indicated, tail a predefined amount of lines
+		$LINES_TO_TAIL = $DEFAULT_LINES_TO_TAIL;
+	}
+} else {
+	$LINES_TO_TAIL = $DEFAULT_LINES_TO_TAIL;
 }
 
 #.................................................
@@ -105,8 +129,8 @@ if ($parameters ne '') {
 print_message( "\nbgztail $parameters\n\"$input_filename\" :\n");
 
 if ( -e $input_filename && !-r $input_filename ) {
-	print_message( "File '$input_filename' is not readable", $CLR_MSG_ERROR );
-	return 1;
+	print_message( "\nError: File '$input_filename' is not readable\n", $CLR_MSG_ERROR );
+	return_error( $EXIT_KO );
 }
 
 # STDOUT->autoflush(1)
@@ -114,7 +138,7 @@ $|=1;
 
 # go to the last bgzip block available (complete or incomplete)
 $file_size = $file_size2 = 0;
-$end_loop = 0;
+$end_loop = $waiting_cycle = 0;
 while ( ! $end_loop ) {
 
 	if ( -e $input_filename ) {
@@ -122,16 +146,16 @@ while ( ! $end_loop ) {
 		if ( $fInput && ! -r $input_filename ) {
 			# file was created AFTER script beginning, but is not readable
 			# (or has didsappear, or whatever).
-			print_message( "File '$input_filename' is not readable", $CLR_MSG_ERROR );
-			return_error( 1 );			
+			print_message( "\nError: File '$input_filename' is not readable\n", $CLR_MSG_ERROR );
+			return_error( $EXIT_KO );
 		}
 
 		if ( ! $fInput ) {
 
 			# open input file (bgzip compressed file)
 			if ( ! open ($fInput, '<', $input_filename) ) {
-				print_message( "Cannot open file '$input_filename'", $CLR_MSG_ERROR );
-				return_error( 1 );
+				print_message( "\nError: Cannot open file '$input_filename'\n", $CLR_MSG_ERROR );
+				return_error( $EXIT_KO );
 			} else {
 				binmode( $fInput );
 			}
@@ -149,8 +173,8 @@ while ( ! $end_loop ) {
 
 			read( $fInput, $buffer, $BGZIP_BLOCK_MARK_LENGTH );
 			if ( ! bgzip_header ( $buffer ) ) {
-				print_message( "\n'$input_filename' is not a valid bgzip file\n", $CLR_MSG_ERROR );
-				return_error( 1 );
+				print_message( "\nError: '$input_filename' is not a valid bgzip file\n", $CLR_MSG_ERROR );
+				return_error( $EXIT_KO );
 			}
 
 			# find a block header, starting backwards from the end of the file
@@ -183,7 +207,7 @@ while ( ! $end_loop ) {
 								# the probabilities that this is *not* a valid bgzip block are
 								# negligible: 2^(16*8)
 								seek( $fInput, -( length($buffer) - $i ), SEEK_CUR );
-								print_message( sprintf("Header found @%d", tell($fInput)) ) if $LOG == 2;
+								print_message( sprintf("Header found @%d\n", tell($fInput)), $CLR_MSG_INFO ) if $LOG == 2;
 								$end_loop = 1;
 								last;
 							}
@@ -194,8 +218,17 @@ while ( ! $end_loop ) {
 			}
 		}
 	}  else {
-		
+
 		# maybe output file is not yet created:
+		if ( $LINES_TO_TAIL >= 0 && $CONTINUOUS_TAILING == 0 ) {
+			# if `-#` but not `-f` were indicated, waiting has no sense
+			print_message( "\nError: File '$input_filename' does not exist.\n", $CLR_MSG_ERROR );
+			return_error( $EXIT_KO );
+		}
+		if ( $waiting_cycle == 0 ) {
+			print_message( "waiting for file '$input_filename' to be created...", $CLR_MSG_INFO );
+			$waiting_cycle = 1;
+		}
 		# sleep and retry
 		select(undef, undef, undef, $SLEEP_NEXIST);
 
@@ -205,13 +238,16 @@ while ( ! $end_loop ) {
 
 
 
+
 # set $fInput handle seek() at last bgzip header from actual tell() until EOF
 decompress_bgzip( \$fInput, $input_filename, $file_size - tell( $fInput ) );
 
-print_message( sprintf("\nStarting decompression @%d\n", tell($fInput)), $CLR_MSG_EOF ) if $LOG == 2;
+print_message( sprintf("\nStarting decompression @%d\n", tell($fInput)), $CLR_MSG_INFO ) if $LOG == 2;
 
 # decompress the file from the last complete found bgzip block header:
-decompress_bgzip( \$fInput, $input_filename );
+return_error(
+	decompress_bgzip( \$fInput, $input_filename )
+	);
 
 
 
@@ -240,8 +276,9 @@ sub decompress_bgzip ( $;$ ) {
 
 	my ( $file_size, $decompression_state, $uncmprssd_buffer,
 		 $sizeof_remaining_block, $sizeof_remaining_file,
-		 $last_header_position, $number_of_bgzip_blocks,
+		 $last_header_position, $last_header_position_2, $number_of_bgzip_blocks,
 		 $waiting_cycle );
+	$waiting_cycle = 0;
 	my ( $DECOMPRESSION_FINISHED, $DECOMPRESSION_INCOMPLETE ) = ( 0, 1 );
 
 RESET_STATE:
@@ -257,26 +294,27 @@ RESET_STATE:
 	} else {
 		$sizeof_remaining_file = $length_of_search;
 	}
-	$last_header_position = tell( $fInput );
+	$last_header_position_2 = $last_header_position = tell( $fInput );
 	while ( 1 ) {
 
 		if ( ! -r $input_filename ) {
 			# file was created AFTER script beginning, but is not readable
 			# (or has didsappear, or whatever).
-			print_message( "File '$input_filename' is not readable", $CLR_MSG_ERROR );
-			return 1;
+			print_message( "\nError: File '$input_filename' is not readable\n", $CLR_MSG_ERROR );
+			return $EXIT_KO;
 		}
 
 		if ( $length_of_search == 0 ){
 			$file_size2 = -s $input_filename;
 		} else {
-			$file_size2 = $length_of_search;
+			$file_size2 = $file_size;
 		}
 		
 		if ( $file_size == $file_size2 ) {
 			if ( $length_of_search > 0 &&
 				 $sizeof_remaining_file < $BGZIP_BLOCK_MARK_LENGTH ) {
 				# search has already found the last valid block
+				print_message( sprintf("Last valid block found @%d", $last_header_position), $CLR_MSG_INFO ) if $LOG == 2;
 				seek( $fInput, $last_header_position, SEEK_SET );
 				return $last_header_position;
 			}
@@ -298,31 +336,33 @@ RESET_STATE:
 			$sizeof_remaining_file += $file_size2 - $file_size; 
 		}
 
+		# check if file has shrunk :-o
+		# This check is not done when searching for last valid block ($length_of_search > 0, fixed $file_size2).
+		if ( tell( $fInput ) > $file_size2 ) {
+			print_message( "\nFile '$input_filename' has shrunk!\nTrying to continue from byte 0...\n", $CLR_MSG_ERROR );
+			# reset state and try to continue from 0 byte...
+			$decompression_state = $DECOMPRESSION_FINISHED;
+			seek( $fInput, 0, SEEK_SET );
+			$buffer = '';
+			goto RESET_STATE;
+		}
+
 		if ( $decompression_state == $DECOMPRESSION_FINISHED ) {
 
 			print_message( sprintf("STATE 0 %s ; Br = %d, Fr = %d", $decompression_state, $sizeof_remaining_block, $sizeof_remaining_file) ) if $LOG == 2;
 			if ( $sizeof_remaining_file < $BGZIP_BLOCK_MARK_LENGTH ) {
 				if ( $length_of_search > 0 ) {
 					# search has already found the last valid block
+					print_message( sprintf("Last valid block found @", $last_header_position) ) if $LOG == 2;
 					seek( $fInput, $last_header_position, SEEK_SET );
 					return $last_header_position;
 				}
-				# check if file has shrunk :-o
-				if ( tell( $fInput ) > $file_size2 ) {
-					print_message( "\nFile '$input_filename' has shrunk!\nTrying to continue from byte 0...\n", $CLR_MSG_ERROR );
-					# reset state and try to continue from 0 byte...
-					$decompression_state = $DECOMPRESSION_FINISHED;
-					seek( $fInput, 0, SEEK_SET );
-					$buffer = '';
-					goto RESET_STATE;
-				} else {
-					# file hasn't grown or is too short to allocate a new block header
-					# sleep and retry
-					print_message( "waiting for input..." ) if $LOG == 2 && $waiting_cycle == 0;
-					$waiting_cycle = 1;
-					select(undef, undef, undef, $SLEEP_TOO_SHORT);
-					next;
-				}
+				# file hasn't grown or is too short to allocate a new block header
+				# sleep and retry
+				print_message( "waiting for input..." ) if $LOG == 2 && $waiting_cycle == 0;
+				$waiting_cycle = 1;
+				select(undef, undef, undef, $SLEEP_TOO_SHORT);
+				next;
 			}
 			$waiting_cycle = 0;
 
@@ -335,15 +375,16 @@ RESET_STATE:
 				# previous decompression was incomplete (bad block!)
 				# or file is corrupted!
 				print_message( sprintf( 
-					"Couldn't correctly read '$input_filename' as a bgzip file @%d", 
+					"\nError: Invalid bgzip header inside file '$input_filename' @%d\n",
 					tell( $fInput ) - $BGZIP_BLOCK_MARK_LENGTH )
 					, $CLR_MSG_ERROR );
 				# running must stop here
-				return 1;
+				return $EXIT_KO;
 
 			}
 
 			# we have a brand new bgzip block!
+			$last_header_position_2 = $last_header_position;
 			$last_header_position = tell( $fInput ) - $BGZIP_BLOCK_MARK_LENGTH;
 			$sizeof_remaining_block = unpack( "S", substr( $buffer, $BGZIP_BLOCK_MARK_LENGTH -2, 2 ) ) + 1 - $BGZIP_BLOCK_MARK_LENGTH;
 
@@ -378,9 +419,17 @@ RESET_STATE:
 			if ( $length_of_search == 0 ) {
 				if ( $PRINT_INCOMPLETE_BLOCKS ) {
 					if ( $decompression_state == $DECOMPRESSION_FINISHED ) {
-						print $uncmprssd_buffer;
+						if ( $LINES_TO_TAIL == -1 ) {
+							print $uncmprssd_buffer;
+						} else {
+							print tail_string( $uncmprssd_buffer, \$LINES_TO_TAIL );
+						}
 					} else {
-						print substr( $uncmprssd_buffer, $i );
+						if ( $LINES_TO_TAIL == -1 ) {
+							print substr( $uncmprssd_buffer, $i );
+						} else {
+							print tail_string( substr( $uncmprssd_buffer, $i ), \$LINES_TO_TAIL );
+						}
 					}
 				}
 			}
@@ -401,9 +450,18 @@ RESET_STATE:
 			$buffer .= $buffer2;
 			# $buffer contains the data of the complete block
 			if ( ($sizeof_remaining_file - $sizeof_remaining_block ) == 0 &&
-				$buffer eq $BGZIP_EOF_MARK						
+				$buffer eq $BGZIP_EOF_MARK
 				) {
-				print_message( "\nEOF! End of bgzip file reached\n", $CLR_MSG_EOF );
+				print_message( "\nEOF! Valid end of bgzip file reached\n", $CLR_MSG_INFO ) if ( $LOG == 2 || $length_of_search == 0 );
+				if ( $length_of_search > 0 && $LINES_TO_TAIL >= 0 ) {
+					print_message( sprintf("Last valid block found @%d", $last_header_position_2), $CLR_MSG_INFO ) if $LOG == 2;
+					seek( $fInput, $last_header_position_2, SEEK_SET );
+					return $last_header_position_2;
+				}
+				if ( $length_of_search == 0 && $CONTINUOUS_TAILING == 0 ) {
+						# if not `-f`, then there's no reason to wait: file has really ended!
+						return $EXIT_OK;
+				}
 				# we are going to continue, in order to decompress piled bgzip contents
 			}
 			if ( ! gunzip \$buffer => \$buffer2 ) {
@@ -424,14 +482,28 @@ RESET_STATE:
 				if ( $length_of_search == 0 ) {
 					$uncmprssd_buffer = $buffer2;
 					if ( $PRINT_INCOMPLETE_BLOCKS ) {
-						print substr( $uncmprssd_buffer, $i );
+						if ( $LINES_TO_TAIL == -1 ) {
+							print substr( $uncmprssd_buffer, $i );
+						} else {
+							print tail_string( substr( $uncmprssd_buffer, $i ), \$LINES_TO_TAIL );
+						}
 					} else {
-						print $uncmprssd_buffer;
+						if ( $LINES_TO_TAIL == -1 ) {
+							print $uncmprssd_buffer;
+						} else {
+							print tail_string( $uncmprssd_buffer, \$LINES_TO_TAIL );
+						}
 					}
 				}				
 			} else {
 				$uncmprssd_buffer = $buffer2;
-				print $uncmprssd_buffer if $length_of_search == 0;
+				if ( $length_of_search == 0 ) {
+					if ( $LINES_TO_TAIL == -1 ) {
+						print $uncmprssd_buffer;
+					} else {
+						print tail_string( $uncmprssd_buffer, \$LINES_TO_TAIL );
+					}
+				}
 			}
 
 			$sizeof_remaining_file -= $sizeof_remaining_block;
@@ -445,6 +517,13 @@ RESET_STATE:
 
 		$file_size = $file_size2;
 
+		if ( $length_of_search == 0 &&
+			 $LINES_TO_TAIL <= 0 &&
+			 $CONTINUOUS_TAILING == 0 ) {
+			print_message( "No more lines to print.", $CLR_MSG_INFO ) if $LOG == 2;
+			return $EXIT_OK;
+		}
+
 	}
 
 }
@@ -453,10 +532,54 @@ RESET_STATE:
 sub bgzip_header {
 
 	if ( substr( shift, 0, $BGZIP_BLOCK_MARK_LENGTH - 2 ) eq $BGZIP_BLOCK_MARK ) {
+		# true
 		return 1;
 	}
 
+	# false
 	return 0;
+
+}
+
+# return at most $$lines_to_tail lines from $buffer
+# and set $$lines_to_tail (is a reference) to -1
+# if there are enough lines to satisfy the request.
+# If there are not enough lines in buffer, return $buffer
+# and decrease $$lines_to_tail consequently
+sub tail_string( $$ ) {
+
+	my $buffer        = shift;
+	my $lines_to_tail = shift; # reference to passed variable
+
+	# treat special case `-0`: show nothing of last block
+	if ( $$lines_to_tail == 0 ) {
+		# but next blocks must be treated as always:
+		$$lines_to_tail = -1;
+		return '';
+	}
+
+	# https://stackoverflow.com/questions/29587158/#29588136
+	my $lines = $buffer =~ tr/\n//;
+	# this count of incomplete lines can lead at the end to
+	# less lines returned than $LINES_TO_TAIL, but this would
+	# occur only with $DECOMPRESSION_INCOMPLETE states (which
+	# are unlikely (impossible?)) or when last block does not
+	# have enough lines to satisfy the request and will wait
+	# for a next new block (`-f`).
+	$lines++ if $buffer !~ /\n\z/;
+
+	if ( $lines >= $$lines_to_tail ) {
+		while ( $lines > $$lines_to_tail ) {
+			$buffer = substr( $buffer, index( $buffer, "\n" ) + 1 );
+			$lines--;
+		}
+		# and next blocks must be treated as always:
+		$$lines_to_tail = -1;
+	} else {
+		$$lines_to_tail -= $lines;
+	}
+
+	return $buffer;
 
 }
 
@@ -509,16 +632,19 @@ contents to STDIN.
 
 Use:
 
-  bgztail [-ChilLv] FILE
+  bgztail [-#CfhilLv] FILE
 
-  FILE may not yet exist: bgzip will wait for its creation.
+  -#: a number: tail only that number of lines, and exit.
 
   -C: do not use colors on error/warning messages.
+
+  -f: output appended data as the file grows (like `tail -f`).
+      If FILE doesn't exist yet, bgztail waits for its creation.
 
   -h: show this help.
 
   -i: do not print incomplete bgzip blocks: instead wait
-      until the bgzip block (<64KiB) is complete for printing.
+      until the bgzip block (<64kiB) is complete for printing.
 
   -l: show internal/verbose decompression processing logs.
 
