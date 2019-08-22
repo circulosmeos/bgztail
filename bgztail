@@ -174,6 +174,7 @@ while ( ! $end_loop ) {
 			read( $fInput, $buffer, $BGZIP_BLOCK_MARK_LENGTH );
 			if ( ! bgzip_header ( $buffer ) ) {
 				print_message( "\nError: '$input_filename' is not a valid bgzip file\n", $CLR_MSG_ERROR );
+				print_message( "\nBut you can use `gztool -t` //github.com/circulosmeos/gztool\n", $CLR_MSG_INFO );
 				return_error( $EXIT_KO );
 			}
 

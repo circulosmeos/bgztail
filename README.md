@@ -4,7 +4,7 @@ Continuous tail Perl script (à la `tail -f`) for *bgzipped* files.
 
 [bgzip](https://github.com/samtools/htslib/blob/develop/bgzip.c) compression format **is compatible with gzip** (uses [standard extensions in RFC 1952](https://tools.ietf.org/html/rfc1952#page-6) to zip in blocks, not in a continuos stream), so bgzipped files can be uncompressed with gunzip.
 
-Nonetheless, `bgztail` can only tail bgzipped files, because gzip implies a complete file reading to reach the tail. This can be cumbersome with compressed files of various Gigabytes in size...
+Nonetheless, `bgztail` can only tail bgzipped files. **If you want to tail generic gzip files (including bgzip files!), you can use [`gztool`](https://github.com/circulosmeos/gztool)**.
 
 `bgztail` **does not** need the index file (as with `bgzip -i`) to be created.
 
@@ -87,6 +87,8 @@ To show only internals of bgzip format handling (not-contents output is always p
 * even incomplete (growing) *bgzip* blocks are supported. Even though incomplete blocks are unlikely to live growing *in the wild*, this can be useful to determine possible corruptions of static *bgzip* files (use *-l* parameter).
 
 * bgzipped-file-to-tail may not exist when running: the script will patiently wait for its creation when `-f` is indicated.
+
+* `bgztail` can only tail bgzipped files. **If you want to tail generic gzip files (including bgzip files!), you can use [`gztool`](https://github.com/circulosmeos/gztool)**.
 
 # Author
 
